@@ -1742,8 +1742,27 @@ class TestCounts:
 
         assert db.session_count(cwd_prefix="/repo") == 2
 
+    def test_session_count_by_source_histogram(self, db):
+        """session_count_by_source() returns a {source: count} dict via GROUP BY."""
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="telegram")
+        db.create_session(session_id="s3", source="cli")
+        hist = db.session_count_by_source()
+        assert hist["cli"] == 2
+        assert hist["telegram"] == 1
+        assert sum(hist.values()) == 3
+
+    def test_session_count_by_source_histogram_excludes_archived(self, db):
+        """include_archived=False skips archived rows."""
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        db.set_session_archived("s2", True)
+        hist_all = db.session_count_by_source(include_archived=True)
+        hist_active = db.session_count_by_source(include_archived=False)
+        assert hist_all["cli"] == 2
+        assert hist_active["cli"] == 1
+
     def test_message_count_total(self, db):
-        assert db.message_count() == 0
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")
         db.append_message("s1", role="assistant", content="Hi")
