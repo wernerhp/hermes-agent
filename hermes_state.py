@@ -797,6 +797,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_archived
+    ON sessions(archived);
 """
 
 FTS_SQL = """
@@ -4611,6 +4613,26 @@ class SessionDB:
         with self._lock:
             cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
             return cursor.fetchone()[0]
+
+    def session_count_by_source(self, include_archived: bool = True) -> Dict[str, int]:
+        """Return a {source: count} histogram using a single aggregate query.
+
+        Replaces per-source ``session_count()`` calls with one GROUP BY query,
+        eliminating the O(N-sources) query fan-out in the dashboard stats
+        endpoint.  Runtime still scales with the number of sessions but issues
+        only a single round-trip to the DB.
+
+        Args:
+            include_archived: when False, exclude archived sessions from counts.
+        """
+        where_sql = "" if include_archived else " WHERE archived = 0"
+        with self._lock:
+            cursor = self._conn.execute(
+                f"SELECT COALESCE(source, 'cli'), COUNT(*)"
+                f" FROM sessions{where_sql}"
+                f" GROUP BY COALESCE(source, 'cli')"
+            )
+            return {row[0]: row[1] for row in cursor.fetchall()}
 
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""
