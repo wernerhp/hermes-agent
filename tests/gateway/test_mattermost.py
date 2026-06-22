@@ -595,22 +595,35 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     assert msg_event.message_id == "top_post_123"
 
 
-# ---------------------------------------------------------------------------
-# Multiplex secondary-profile scope
-# ---------------------------------------------------------------------------
-#
-# __init__'s url/reply_mode, validate_mattermost_config's url,
-# _standalone_send's url, and _handle_ws_event's require_mention/
-# free_response_channels/allowed_channels, all previously read raw
-# os.getenv unconditionally (only MATTERMOST_TOKEN was already scoped).
-# _apply_yaml_config also wrote MATTERMOST_REQUIRE_MENTION/
-# MATTERMOST_FREE_RESPONSE_CHANNELS/MATTERMOST_ALLOWED_CHANNELS into the
-# process-global os.environ unconditionally. Under multiplex, os.environ
-# holds the DEFAULT profile's YAML-to-env bridge output -- a secondary
-# profile with its own (different or absent) Mattermost config would
-# silently connect to the default profile's server, or have its
-# mention-gating/channel-allowlist decisions driven by the default
-# profile's settings. Mirrors the LINE/DingTalk/IRC fix for #98738.
+@pytest.mark.asyncio
+async def test_mattermost_dm_root_post_seeds_thread_id_for_session_continuity():
+    """DM root posts must seed thread_id=post_id so that threaded DM replies
+    land in the same session (PR #37144 — session-split fix extended to DMs).
+
+    Before this fix, root DM post → thread_id=None (session key = dm_chan)
+    while threaded reply → thread_id=root_id (session key = dm_chan:root_id),
+    causing the agent to lose all conversation context on the first reply.
+    """
+    adapter = _make_adapter()
+    adapter._reply_mode = "thread"
+    adapter._bot_user_id = "bot_user_id"
+    adapter._bot_username = "hermes-bot"
+    adapter.handle_message = AsyncMock()
+    post_data = {
+        "id": "dm_post_123",
+        "user_id": "user_123",
+        "channel_id": "dm_chan",
+        "message": "hello",
+        "root_id": "",
+    }
+    event = {
+        "event": "posted",
+        "data": {
+            "post": json.dumps(post_data),
+            "channel_type": "D",
+            "sender_name": "@alice",
+        },
+    }
 
 @pytest.fixture
 def multiplex_scope():
@@ -711,8 +724,11 @@ class TestMultiplexProfileScope:
             assert "MATTERMOST_REQUIRE_MENTION" not in os.environ
 
     msg_event = adapter.handle_message.call_args[0][0]
-    assert msg_event.source.thread_id is None
+    # Root DM post seeds thread_id = post_id so that threaded replies
+    # (which carry root_id=dm_post_123) resolve to the same session.
+    assert msg_event.source.thread_id == "dm_post_123"
     assert msg_event.source.message_id == "dm_post_123"
+
 
 
 # ---------------------------------------------------------------------------
@@ -1163,3 +1179,35 @@ class TestLiveThinkingBubbleConcurrency:
         assert post_ids[0] in fake.sent
         # No edit ever targeted a None / orphan id.
         assert all(mid is not None for mid, _ in fake.edited)
+
+
+@pytest.mark.asyncio
+async def test_mattermost_dm_reply_uses_root_id_as_thread_id():
+    """DM thread replies carry root_id; the session key must match the root post."""
+    adapter = _make_adapter()
+    adapter._reply_mode = "thread"
+    adapter._bot_user_id = "bot_user_id"
+    adapter._bot_username = "hermes-bot"
+    adapter.handle_message = AsyncMock()
+    post_data = {
+        "id": "dm_reply_456",
+        "user_id": "user_123",
+        "channel_id": "dm_chan",
+        "message": "follow-up",
+        "root_id": "dm_post_123",  # threaded reply
+    }
+    event = {
+        "event": "posted",
+        "data": {
+            "post": json.dumps(post_data),
+            "channel_type": "D",
+            "sender_name": "@alice",
+        },
+    }
+
+    await adapter._handle_ws_event(event)
+
+    msg_event = adapter.handle_message.call_args[0][0]
+    # Reply carries root_id — session key must match the root post's thread_id.
+    assert msg_event.source.thread_id == "dm_post_123"
+    assert msg_event.source.message_id == "dm_reply_456"
