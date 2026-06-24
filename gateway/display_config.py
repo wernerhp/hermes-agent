@@ -28,9 +28,11 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Delete tool-progress / "⏳ Working" bubbles after a SUCCESSFUL final response where deletion is
     # supported (Telegram); failed runs keep them as breadcrumbs.
     "cleanup_progress": False,
-    # Working-state text on text-rendering indicators (Slack assistant status): "full"/true = verb +
-    # argument preview, "verb" = verb only (keeps paths out of shared channels), "off"/false = static.
-    "live_status": "full",
+    # When true, show a single live-editing "thinking bubble" that is updated
+    # in place for each completed interim thought, then deleted when the final
+    # answer lands. Strictly opt-in — default false everywhere. Must be
+    # enabled explicitly per-platform (e.g. display.platforms.mattermost.live_thinking: true).
+    "live_thinking": False,
 }
 
 # Tiers: HIGH = editing, personal/team use; MEDIUM = editing but customer-facing;
@@ -201,6 +203,37 @@ _NORMALISERS: dict[str, Any] = {
 
 
 def _normalise(setting: str, value: Any) -> Any:
-    """Normalise a user-supplied value for *setting*; unknown settings pass through."""
-    norm = _NORMALISERS.get(setting)
-    return norm(value) if norm else value
+    """Normalise YAML quirks (bare ``off`` → False in YAML 1.1)."""
+    if setting == "tool_progress":
+        if value is False:
+            return "off"
+        if value is True:
+            return "all"
+        return str(value).lower()
+    if setting in {
+        "show_reasoning",
+        "streaming",
+        "interim_assistant_messages",
+        "long_running_notifications",
+        "busy_ack_detail",
+        "live_thinking",
+    }:
+        if isinstance(value, str):
+            return value.lower() in {"true", "1", "yes", "on"}
+        return bool(value)
+    if setting == "cleanup_progress":
+        if isinstance(value, str):
+            return value.lower() in {"true", "1", "yes", "on"}
+        return bool(value)
+    if setting == "tool_progress_grouping":
+        val = str(value).lower()
+        return val if val in ("accumulate", "separate") else "accumulate"
+    if setting == "reasoning_style":
+        val = str(value).lower()
+        return val if val in ("code", "blockquote", "subtext") else "code"
+    if setting == "tool_preview_length":
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+    return value

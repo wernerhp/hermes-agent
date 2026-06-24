@@ -213,13 +213,24 @@ class MattermostAdapter(BasePlatformAdapter):
                 payload["root_id"] = await self._resolve_root_id(str(candidate))
         return await self._post_preserving_thread(chat_id, payload, metadata)
 
-    async def _post_with_file(self, chat_id: str, file_id: str, caption: Optional[str], reply_to: Optional[str],
-                              metadata: _Metadata) -> SendResult:
-        return _post_result(await self._post_message(chat_id, caption or "", reply_to, metadata, [file_id]),
-                            _POST_WITH_FILE_ERROR)
+    async def _api_delete(self, path: str) -> Dict[str, Any]:
+        """DELETE /api/v4/{path}. Returns the parsed JSON body (e.g. {\"status\": \"OK\"})."""
+        import aiohttp
+        url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
+        try:
+            async with self._session.delete(url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.error("MM API DELETE %s → %s: %s", path, resp.status, body[:200])
+                    return {}
+                return await resp.json()
+        except aiohttp.ClientError as exc:
+            logger.error("MM API DELETE %s network error: %s", path, exc)
+            return {}
 
-    async def _upload_file(self, channel_id: str, file_data: bytes, filename: str,
-                           content_type: str = "application/octet-stream") -> Optional[str]:
+    async def _upload_file(
+        self, channel_id: str, file_data: bytes, filename: str, content_type: str = "application/octet-stream"
+    ) -> Optional[str]:
         """Upload a file and return its file ID, or None on failure."""
         import aiohttp
         form = aiohttp.FormData()
@@ -308,9 +319,41 @@ class MattermostAdapter(BasePlatformAdapter):
                          reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
         return await self._send_url_as_file(chat_id, image_url, caption, reply_to, "image", metadata)
 
-    async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
-                              reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
-        return await self._send_local_file(chat_id, image_path, caption, reply_to, metadata=metadata)
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a post by its ID.
+
+        Returns True when Mattermost confirms deletion (``{"status": "OK"}``),
+        False on any error. ``chat_id`` is accepted for API symmetry but
+        Mattermost's DELETE /api/v4/posts/{id} endpoint does not need it.
+        """
+        data = await self._api_delete(f"posts/{message_id}")
+        return bool(data and data.get("status") == "OK")
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Download an image and upload it as a file attachment."""
+        return await self._send_url_as_file(
+            chat_id, image_url, caption, reply_to, "image", metadata
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Upload a local image file."""
+        return await self._send_local_file(
+            chat_id, image_path, caption, reply_to, metadata=metadata
+        )
 
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
