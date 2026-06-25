@@ -4766,3 +4766,139 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# GAP-011 / ADR-0015: guard / loader parity tests
+# ---------------------------------------------------------------------------
+
+
+class TestGuardLoaderParity:
+    """Verify that resolve_skill_on_disk is the single source of truth.
+
+    Post-fix invariant: ``resolve_skill_on_disk(name, skills_dir=...,
+    external_dirs=...)`` returns a truthy Path iff the loader (skill_view)
+    can also load that skill.  The dangerous ``guard=True AND loader-missing``
+    state must be structurally impossible.
+    """
+
+    def _make_skill(self, skills_dir, name, category=None, body="Do the thing."):
+        if category:
+            skill_dir = skills_dir / category / name
+        else:
+            skill_dir = skills_dir / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Test {name}.\n---\n\n{body}\n"
+        )
+        return skill_dir
+
+    def test_both_copies_guard_equals_loader(self, tmp_path):
+        """Both-copies fixture: guard==True and loader loads (parity)."""
+        from unittest.mock import patch
+        import json
+
+        from agent.skill_utils import resolve_skill_on_disk
+        from tools.skills_tool import skill_view
+
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        self._make_skill(local_dir, "kanban-worker", category="devops",
+                         body="LOCAL KANBAN-WORKER")
+        self._make_skill(external_dir, "kanban-worker", body="EXTERNAL KANBAN-WORKER")
+
+        # Guard check using resolve_skill_on_disk
+        guard_result = resolve_skill_on_disk(
+            "kanban-worker",
+            skills_dir=local_dir,
+            external_dirs=[external_dir],
+        )
+        assert guard_result is not None, (
+            "resolve_skill_on_disk returned None for both-copies fixture"
+        )
+
+        # Loader check using skill_view
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_dir],
+            ),
+        ):
+            raw = skill_view("kanban-worker")
+        result = json.loads(raw)
+        loader_ok = result.get("success") is True
+
+        # Invariant: guard == loader
+        assert bool(guard_result) == loader_ok, (
+            f"guard={bool(guard_result)!r} != loader={loader_ok!r}: "
+            "guard/loader disagreement (GAP-011 regression)"
+        )
+
+    def test_single_copy_clean_profile_guard_equals_loader(self, tmp_path):
+        """Clean single-copy profile: guard==True and loader loads (parity)."""
+        from unittest.mock import patch
+        import json
+
+        from agent.skill_utils import resolve_skill_on_disk
+        from tools.skills_tool import skill_view
+
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        self._make_skill(local_dir, "kanban-worker", body="SINGLE KANBAN-WORKER")
+
+        guard_result = resolve_skill_on_disk(
+            "kanban-worker",
+            skills_dir=local_dir,
+            external_dirs=[],
+        )
+        assert guard_result is not None
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        ):
+            raw = skill_view("kanban-worker")
+        result = json.loads(raw)
+        loader_ok = result.get("success") is True
+
+        assert bool(guard_result) == loader_ok
+
+    def test_missing_skill_guard_false_loader_also_false(self, tmp_path):
+        """Skill absent from both local and external: guard==False, loader also False."""
+        from unittest.mock import patch
+        import json
+
+        from agent.skill_utils import resolve_skill_on_disk
+        from tools.skills_tool import skill_view
+
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        guard_result = resolve_skill_on_disk(
+            "nonexistent-skill",
+            skills_dir=local_dir,
+            external_dirs=[external_dir],
+        )
+        assert guard_result is None
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_dir],
+            ),
+        ):
+            raw = skill_view("nonexistent-skill")
+        result = json.loads(raw)
+        loader_ok = result.get("success") is True
+
+        assert bool(guard_result) == loader_ok  # both False

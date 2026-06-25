@@ -1152,8 +1152,8 @@ class TestSkillViewCollisionDetection:
         )
 
     def test_nested_local_collides_with_top_level_external(self, tmp_path):
-        """The original bug scenario: nested local + top-level external,
-        same name. Now refuses with both paths surfaced."""
+        """Local-first fix (GAP-011 / ADR-0015): nested local + top-level
+        external with the same name — local copy wins, no error returned."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
@@ -1172,18 +1172,14 @@ class TestSkillViewCollisionDetection:
             raw = skill_view("explore-codebase")
 
         result = json.loads(raw)
-        assert result["success"] is False
-        assert "Ambiguous skill name 'explore-codebase'" in result["error"]
-        assert "matches" in result
-        assert len(result["matches"]) == 2
-        # Both paths surfaced
-        assert any("foundations/runtime" in p for p in result["matches"])
-        assert any("external" in p for p in result["matches"])
-        assert "hint" in result
+        # After GAP-011 fix: local-first winner, not an error
+        assert result["success"] is True
+        assert "LOCAL VERSION" in result["content"]
+        assert any("foundations/runtime" in p for p in result.get("matches", [result.get("path", "")]))
 
     def test_top_level_local_collides_with_external(self, tmp_path):
-        """Top-level local + top-level external with the same name also
-        refuses — same-name shadowing is ambiguous regardless of nesting."""
+        """Local-first fix (GAP-011): top-level local + top-level external with
+        the same name — local copy wins, no error returned."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
@@ -1197,9 +1193,9 @@ class TestSkillViewCollisionDetection:
             raw = skill_view("shared-name")
 
         result = json.loads(raw)
-        assert result["success"] is False
-        assert "Ambiguous" in result["error"]
-        assert len(result["matches"]) == 2
+        # After GAP-011 fix: local-first winner, not an error
+        assert result["success"] is True
+        assert "LOCAL VERSION" in result["content"]
 
     def test_collision_resolvable_via_categorized_path(self, tmp_path):
         """User can recover from a collision by passing the full
@@ -1326,9 +1322,9 @@ class TestSkillViewCollisionDetection:
         assert result["success"] is True
         assert "EXTERNAL BODY" in result["content"]
 
-    def test_two_externals_same_name_also_refuse(self, tmp_path):
-        """Collision detection is symmetric — two external dirs with
-        same-name skills also trigger the refusal."""
+    def test_two_externals_same_name_first_wins(self, tmp_path):
+        """When two external dirs have the same skill name (no local copy),
+        the first external dir wins (config order). No error returned."""
         local_dir = tmp_path / "local"
         ext_a = tmp_path / "ext_a"
         ext_b = tmp_path / "ext_b"
@@ -1344,9 +1340,9 @@ class TestSkillViewCollisionDetection:
             raw = skill_view("pr")
 
         result = json.loads(raw)
-        assert result["success"] is False
-        assert "Ambiguous" in result["error"]
-        assert len(result["matches"]) == 2
+        # After GAP-011 fix: first external wins (config order), not an error
+        assert result["success"] is True
+        assert "EXT_A VERSION" in result["content"]
 
     def test_local_only_skill_loads_normally(self, tmp_path):
         """Sanity: a single local skill (no external collision) loads
@@ -1370,3 +1366,112 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+
+class TestSkillNameCollision:
+    """GAP-011 / ADR-0015 regression: both-copies fixture.
+
+    Verifies that a profile with BOTH a local kanban-worker copy AND an
+    external_dirs copy no longer raises ValueError / returns missing.
+    The local-first winner must be selected and the skill must load.
+    """
+
+    def _patch_dirs(self, local_dir, external_dirs):
+        return (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=list(external_dirs),
+            ),
+        )
+
+    def test_both_copies_kanban_worker_loads(self, tmp_path):
+        """kanban-worker with both a local copy and an external copy must load.
+
+        This is the exact GAP-011 scenario: dispatcher-injected kanban-worker
+        profile has a local devops/kanban-worker SKILL.md AND an external_dirs
+        shared copy.  Before the fix: skill_view returned success=False and
+        build_preloaded_skills_prompt added 'kanban-worker' to missing[].
+        After fix: local copy wins, missing==[].
+        """
+        from agent.skill_commands import build_preloaded_skills_prompt
+
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        # Local copy nested under a category (devops/kanban-worker)
+        _make_skill(
+            local_dir,
+            "kanban-worker",
+            category="devops",
+            body="LOCAL KANBAN-WORKER",
+        )
+        # External (shared) copy at top-level
+        _make_skill(external_dir, "kanban-worker", body="EXTERNAL KANBAN-WORKER")
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            # Verify skill_view resolves to local copy
+            raw = skill_view("kanban-worker")
+            result = json.loads(raw)
+            assert result["success"] is True, (
+                f"skill_view returned error (GAP-011 regression): {result}"
+            )
+            assert "LOCAL KANBAN-WORKER" in result["content"]
+
+            # Verify build_preloaded_skills_prompt has no missing entries
+            _prompt, loaded, missing = build_preloaded_skills_prompt(["kanban-worker"])
+            assert "kanban-worker" in loaded, (
+                f"kanban-worker not in loaded={loaded!r}, missing={missing!r}"
+            )
+            assert missing == [], (
+                f"kanban-worker in missing (GAP-011 regression): {missing!r}"
+            )
+
+    def test_kanban_orchestrator_loads_with_both_copies(self, tmp_path):
+        """kanban-orchestrator also uses skill_view — same collision block fix."""
+        from agent.skill_commands import build_preloaded_skills_prompt
+
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        _make_skill(
+            local_dir,
+            "kanban-orchestrator",
+            category="devops",
+            body="LOCAL KANBAN-ORCHESTRATOR",
+        )
+        _make_skill(
+            external_dir, "kanban-orchestrator", body="EXTERNAL KANBAN-ORCHESTRATOR"
+        )
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            _prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["kanban-orchestrator"]
+            )
+            assert "kanban-orchestrator" in loaded
+            assert missing == []
+
+    def test_single_match_shared_skill_unchanged(self, tmp_path):
+        """Shared skill with exactly one match (no collision) still resolves
+        unchanged — the >1 branch is never entered for ~75 non-colliding skills.
+        """
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        # Only in external, no local copy
+        _make_skill(external_dir, "github-pr-workflow", body="SHARED ONLY")
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            raw = skill_view("github-pr-workflow")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "SHARED ONLY" in result["content"]

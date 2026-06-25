@@ -803,3 +803,65 @@ class TestInlineShellExpansion:
         # The command's intended stdout never made it through — only the
         # timeout marker (which echoes the command text) survives.
         assert "DYN_MARKER" not in msg.replace("sleep 5 && printf DYN_MARKER", "")
+
+
+class TestBothCopiesFixture:
+    """GAP-011 / ADR-0015: both-copies fixture for build_preloaded_skills_prompt.
+
+    When a profile has both a local kanban-worker copy AND an external_dirs
+    copy, build_preloaded_skills_prompt must return loaded==['kanban-worker']
+    and missing==[] — the ValueError('Unknown skill(s): kanban-worker') must
+    not occur.
+    """
+
+    def test_both_copies_loaded_not_missing(self, tmp_path):
+        """loaded == ['kanban-worker'] and missing == [] for both-copies fixture."""
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        # Local copy nested under devops/ category
+        _make_skill(local_dir, "kanban-worker", category="devops",
+                    body="LOCAL KANBAN-WORKER")
+        # External (shared) copy
+        _make_skill(external_dir, "kanban-worker", body="EXTERNAL KANBAN-WORKER")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_dir],
+            ),
+        ):
+            _prompt, loaded, missing = build_preloaded_skills_prompt(["kanban-worker"])
+
+        assert loaded == ["kanban-worker"], (
+            f"Expected loaded==['kanban-worker'], got {loaded!r}"
+        )
+        assert missing == [], (
+            f"Expected missing==[], got {missing!r} — GAP-011 regression"
+        )
+
+    def test_single_copy_clean_profile_still_loads(self, tmp_path):
+        """A profile with only one kanban-worker copy (no collision) still loads."""
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        # Only local copy, no external
+        _make_skill(local_dir, "kanban-worker", category="devops",
+                    body="SINGLE LOCAL KANBAN-WORKER")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[],
+            ),
+        ):
+            _prompt, loaded, missing = build_preloaded_skills_prompt(["kanban-worker"])
+
+        assert "kanban-worker" in loaded
+        assert missing == []

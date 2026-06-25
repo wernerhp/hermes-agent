@@ -1081,27 +1081,24 @@ def skill_view(
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
+            # Local-first precedence: all_dirs is [SKILLS_DIR, *external_dirs],
+            # so candidates[0] is always the local winner (or the first
+            # external_dirs entry if there is no local copy).  Selecting it here
+            # finishes what the ordering already started instead of refusing.
+            # This matches _find_all_skills() dedup logic ("local takes
+            # precedence") and is the durable fix for the dispatcher crash where
+            # a profile with BOTH a local kanban-worker copy AND an external_dirs
+            # copy raised ValueError("Unknown skill(s): kanban-worker") before
+            # the agent loop started (GAP-011 / ADR-0015).
             logging.getLogger(__name__).warning(
-                "Skill name collision for '%s': %d candidates — %s",
-                name, len(candidates), "; ".join(paths),
+                "Skill name collision for '%s': %d candidates — selecting local-first "
+                "winner %s (others: %s)",
+                name,
+                len(candidates),
+                paths[0],
+                "; ".join(paths[1:]),
             )
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": (
-                        f"Ambiguous skill name '{name}': {len(candidates)} skills "
-                        "match across your local skills dir and external_dirs. "
-                        "Refusing to guess — load one explicitly by its categorized path."
-                    ),
-                    "matches": paths,
-                    "hint": (
-                        "Pass the full relative path instead of the bare name "
-                        "(e.g., 'category/skill-name'), or rename one of the "
-                        "colliding skills so each name is unique."
-                    ),
-                },
-                ensure_ascii=False,
-            )
+            candidates = [candidates[0]]
 
         if candidates:
             skill_dir, skill_md = candidates[0]

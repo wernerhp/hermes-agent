@@ -413,7 +413,7 @@ def _external_dirs_cache_clear() -> None:
     _raw_config_cache_clear()
 
 
-def get_external_skills_dirs() -> List[Path]:
+def get_external_skills_dirs(home: Optional[Path] = None) -> List[Path]:
     """Read ``skills.external_dirs`` from config.yaml and return validated paths.
 
     Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
@@ -424,7 +424,59 @@ def get_external_skills_dirs() -> List[Path]:
     called once per skill during banner / tool-registry scans, and YAML
     parsing a non-trivial config dominates ``hermes`` cold-start time
     when the cache is absent.
+
+    Args:
+        home: Optional HERMES_HOME override.  When supplied the config and
+            skills dir are resolved relative to *home* instead of the
+            process-level ``get_hermes_home()``.  This lets the dispatcher
+            resolve external dirs for a *worker* profile without mutating
+            global state.  When ``None`` (the default) the existing
+            process-level resolution is used (backward-compatible).
     """
+    if home is not None:
+        # Non-default home: read config + skills dir directly without
+        # in-process caching (each profile is distinct; cross-profile cache
+        # poisoning would be a hard-to-debug correctness bug).
+        _hcfg = home / "config.yaml"
+        if not _hcfg.exists():
+            return []
+        import yaml as _yaml
+        try:
+            _parsed_h = _yaml.safe_load(_hcfg.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return []
+        _skills_cfg_h = _parsed_h.get("skills")
+        if not isinstance(_skills_cfg_h, dict):
+            return []
+        _raw_h = _skills_cfg_h.get("external_dirs")
+        if not _raw_h:
+            return []
+        if isinstance(_raw_h, str):
+            _raw_h = [_raw_h]
+        if not isinstance(_raw_h, list):
+            return []
+        _local_h = (home / "skills").resolve()
+        _seen_h: Set[Path] = set()
+        _result_h: List[Path] = []
+        for _entry in _raw_h:
+            _entry = str(_entry).strip()
+            if not _entry:
+                continue
+            _exp = os.path.expanduser(os.path.expandvars(_entry))
+            _p = Path(_exp)
+            if not _p.is_absolute():
+                _p = (home / _p).resolve()
+            else:
+                _p = _p.resolve()
+            if _p == _local_h or _p in _seen_h:
+                continue
+            if _p.is_dir():
+                _seen_h.add(_p)
+                _result_h.append(_p)
+            else:
+                logger.debug("External skills dir does not exist, skipping: %s", _p)
+        return _result_h
+
     config_path = get_config_path()
     if not config_path.exists():
         return []
@@ -533,6 +585,55 @@ def is_external_skill_path(path) -> bool:
         except ValueError:
             continue
     return False
+
+
+def resolve_skill_on_disk(
+    name: str,
+    *,
+    skills_dir: Optional[Path] = None,
+    external_dirs: Optional[List[Path]] = None,
+) -> Optional[Path]:
+    """Return the SKILL.md path for *name* using local-first precedence.
+
+    This is the single on-disk resolver shared by both the skill loader
+    (``skill_view``) and any guard that checks whether a skill exists before
+    spawning a worker.  Using a single resolver guarantees that
+    ``guard(profile) == True`` iff the loader can actually load the skill —
+    the ``guard=True AND loader-missing`` state becomes structurally
+    impossible (ADR-0015 / GAP-011 Fix B invariant).
+
+    Search order matches ``skill_view``'s ``all_dirs`` construction:
+    *skills_dir* first, then *external_dirs* in order.  Returns the first
+    matching SKILL.md, or ``None`` if no match is found.
+
+    Args:
+        name: Bare skill name (e.g. ``"kanban-worker"``).
+        skills_dir: Profile-local skills root.  Defaults to the process-level
+            ``get_skills_dir()`` when ``None``.
+        external_dirs: External skill directories from ``skills.external_dirs``.
+            Defaults to the process-level ``get_external_skills_dirs()`` when
+            ``None``.
+    """
+    if skills_dir is None:
+        skills_dir = get_skills_dir()
+    if external_dirs is None:
+        external_dirs = get_external_skills_dirs()
+
+    all_dirs: List[Path] = []
+    if skills_dir.exists():
+        all_dirs.append(skills_dir)
+    all_dirs.extend(external_dirs)
+
+    for search_dir in all_dirs:
+        # Direct directory match: <search_dir>/<name>/SKILL.md
+        candidate = search_dir / name / "SKILL.md"
+        if candidate.exists():
+            return candidate
+        # Recursive directory-name match (nested category skills)
+        for skill_md in search_dir.rglob("SKILL.md"):
+            if skill_md.parent.name == name:
+                return skill_md
+    return None
 
 
 # ── Condition extraction ──────────────────────────────────────────────────
