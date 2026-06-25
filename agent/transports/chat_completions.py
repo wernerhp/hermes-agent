@@ -479,11 +479,79 @@ class ChatCompletionsTransport(ProviderTransport):
         # Profiles fronting several backends override get_max_tokens() per model.
         _apply_max_tokens(api_kwargs, model, reasoning_config, params, profile_max=profile.get_max_tokens(model))
 
-        extra_body_from_profile, top_level_from_profile = profile.build_api_kwargs_extras(
-            reasoning_config=reasoning_config, supports_reasoning=params.get("supports_reasoning", False),
-            qwen_session_metadata=params.get("qwen_session_metadata"), model=model,
-            base_url=params.get("base_url"), ollama_num_ctx=params.get("ollama_num_ctx"),
-            session_id=params.get("session_id"),
+        # Message preprocessing
+        sanitized = profile.prepare_messages(sanitized)
+
+        # Developer role swap — model-name-based, applies to all providers
+        _model_lower = (model or "").lower()
+        if (
+            sanitized
+            and isinstance(sanitized[0], dict)
+            and sanitized[0].get("role") == "system"
+            and any(p in _model_lower for p in DEVELOPER_ROLE_MODELS)
+        ):
+            sanitized = list(sanitized)
+            sanitized[0] = {**sanitized[0], "role": "developer"}
+
+        api_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": sanitized,
+        }
+
+        # Temperature
+        if profile.fixed_temperature is OMIT_TEMPERATURE:
+            pass  # Don't include temperature at all
+        elif profile.fixed_temperature is not None:
+            api_kwargs["temperature"] = profile.fixed_temperature
+        else:
+            # Use caller's temperature if provided
+            temp = params.get("temperature")
+            if temp is not None:
+                api_kwargs["temperature"] = temp
+
+        # Timeout
+        timeout = params.get("timeout")
+        if timeout is not None:
+            api_kwargs["timeout"] = timeout
+
+        # Tools — apply Moonshot/Kimi schema sanitization regardless of path
+        if tools:
+            if is_moonshot_model(model):
+                tools = sanitize_moonshot_tools(tools)
+            api_kwargs["tools"] = tools
+
+        # max_tokens resolution — priority: ephemeral > user > profile default
+        max_tokens_fn = params.get("max_tokens_param_fn")
+        ephemeral = params.get("ephemeral_max_output_tokens")
+        user_max = params.get("max_tokens")
+        anthropic_max = params.get("anthropic_max_output")
+        # Per-model default cap — profiles override get_max_tokens() when
+        # they front several backends with different completion-token limits
+        # (e.g. opencode-go: mimo-v2.5-pro = 131072).
+        profile_max = profile.get_max_tokens(model)
+
+        if ephemeral is not None and max_tokens_fn:
+            api_kwargs.update(max_tokens_fn(ephemeral))
+        elif user_max is not None and max_tokens_fn:
+            api_kwargs.update(max_tokens_fn(user_max))
+        elif profile_max and max_tokens_fn:
+            api_kwargs.update(max_tokens_fn(profile_max))
+        elif anthropic_max is not None:
+            api_kwargs["max_tokens"] = anthropic_max
+
+        # Provider-specific api_kwargs extras (reasoning_effort, metadata, etc.)
+        reasoning_config = params.get("reasoning_config")
+        extra_body_from_profile, top_level_from_profile = (
+            profile.build_api_kwargs_extras(
+                reasoning_config=reasoning_config,
+                supports_reasoning=params.get("supports_reasoning", False),
+                qwen_session_metadata=params.get("qwen_session_metadata"),
+                model=model,
+                base_url=params.get("base_url"),
+                api_key=params.get("api_key"),
+                ollama_num_ctx=params.get("ollama_num_ctx"),
+                session_id=params.get("session_id"),
+            )
         )
         api_kwargs.update(top_level_from_profile)
 

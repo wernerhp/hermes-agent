@@ -1412,9 +1412,56 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         # Profiles handle per-provider quirks via hooks fed the context above.
         return transport.build_kwargs(provider_profile=_profile, **_common)
 
-    # Legacy flag path: only for a provider absent from the providers/ registry.
-    return transport.build_kwargs(
-        **_common,
+        # Strip image parts for non-vision models that have provider profiles
+        # (e.g. DeepSeek, Kimi). The legacy path below already does this, but
+        # registered providers with profiles were bypassing the strip.
+        api_messages = agent._prepare_messages_for_non_vision_model(api_messages)
+
+        return _ct.build_kwargs(
+            model=agent.model,
+            messages=api_messages,
+            tools=tools_for_api,
+            base_url=agent.base_url,
+            timeout=agent._resolved_api_call_timeout(),
+            max_tokens=agent.max_tokens,
+            ephemeral_max_output_tokens=_ephemeral_out,
+            max_tokens_param_fn=agent._max_tokens_param,
+            reasoning_config=agent.reasoning_config,
+            request_overrides=agent.request_overrides,
+            session_id=getattr(agent, "session_id", None),
+            provider_profile=_profile,
+            ollama_num_ctx=agent._ollama_num_ctx,
+            # Context forwarded to profile hooks:
+            provider_preferences=_prefs or None,
+            openrouter_min_coding_score=agent.openrouter_min_coding_score,
+            anthropic_max_output=_ant_max,
+            supports_reasoning=agent._supports_reasoning_extra_body(),
+            api_key=getattr(agent, "api_key", None),
+            qwen_session_metadata=_qwen_meta,
+        )
+
+    # ── Legacy flag path ────────────────────────────────────────────
+    # Reached only when get_provider_profile() returns None — i.e. a
+    # completely unknown provider not in providers/ registry.
+    _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
+    if _ephemeral_out is not None:
+        agent._ephemeral_max_output_tokens = None
+
+    # Strip image parts for non-vision models (no-op when vision-capable).
+    _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
+
+    return _ct.build_kwargs(
+        model=agent.model,
+        messages=_msgs_for_chat,
+        tools=tools_for_api,
+        base_url=agent.base_url,
+        timeout=agent._resolved_api_call_timeout(),
+        max_tokens=agent.max_tokens,
+        ephemeral_max_output_tokens=_ephemeral_out,
+        max_tokens_param_fn=agent._max_tokens_param,
+        reasoning_config=agent.reasoning_config,
+        request_overrides=agent.request_overrides,
+        session_id=getattr(agent, "session_id", None),
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
         is_nous=base_url_host_matches(_host, "nousresearch.com"),
