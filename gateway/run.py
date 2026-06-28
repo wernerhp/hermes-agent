@@ -16123,6 +16123,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.adapters.get(source.platform) if _live_thinking_enabled else None
         )
         if _live_thinking_adapter is not None and (
+            type(_live_thinking_adapter).edit_message is BasePlatformAdapter.edit_message
+        ):
+            # Platform doesn't implement edit_message; creating a new post per
+            # thought would be noisy and orphan prior bubbles. Disable entirely,
+            # matching the cleanup_progress guard at the send-progress path.
+            logger.warning(
+                "live_thinking enabled but %s adapter has no edit_message; disabling",
+                source.platform.value if source.platform else "unknown",
+            )
+            _live_thinking_adapter = None
+        if _live_thinking_adapter is not None and (
             type(_live_thinking_adapter).delete_message is BasePlatformAdapter.delete_message
         ):
             # Platform doesn't support deletion; edit-in-place still works but

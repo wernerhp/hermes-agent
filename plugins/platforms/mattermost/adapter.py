@@ -241,7 +241,11 @@ class MattermostAdapter(BasePlatformAdapter):
         import aiohttp
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
         try:
-            async with self._session.delete(url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            async with self._session.delete(
+                url,
+                headers=self._headers(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
                     logger.error("MM API DELETE %s → %s: %s", path, resp.status, body[:200])
