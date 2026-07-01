@@ -16350,9 +16350,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
+                    elif _live_thinking_enabled and _live_thinking_adapter and not already_streamed:
+                        # live_thinking IS the streaming experience for this platform —
+                        # bypass the stream consumer commentary path and fall through to
+                        # the bubble update below.  Letting on_commentary() handle it
+                        # would swallow the thought into the stream consumer's buffer
+                        # instead of updating the thinking bubble.
+                        pass
                     else:
                         _stream_consumer.on_commentary(text)
-                    return
+                        return
                 if already_streamed or not str(text or "").strip():
                     return
                 # ------------------------------------------------------------------
@@ -16596,7 +16603,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 voice_ack_callback if _voice_ack_guild[0] is not None else None
             )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
-            agent.stream_delta_callback = _stream_delta_cb
+            # Suppress per-token streaming when live_thinking is active:
+            # live_thinking IS the progressive-update experience for this platform
+            # and per-token edits would flood the messaging API on every token.
+            agent.stream_delta_callback = None if _live_thinking_enabled else _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if (_want_interim_messages or _live_thinking_enabled) else None
             agent.status_callback = _status_callback_sync
             # Credits / out-of-band notices (usage bands, depletion, restored).
@@ -18176,24 +18186,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # so it seamlessly becomes the response, avoiding a delete
                 # + send sequence that leaves a "(message deleted)" artifact.
                 _lt_bubble_id = _live_thinking_post_ids[0]
-                try:
-                    _lt_edit_res = await _live_thinking_adapter.edit_message(
-                        source.chat_id,
-                        _lt_bubble_id,
-                        _final,
-                        finalize=True,
-                    )
-                    if getattr(_lt_edit_res, "success", False):
-                        response["already_sent"] = True
-                        # Clear so the post-delivery delete callback is a no-op.
-                        _live_thinking_post_ids.clear()
-                        logger.info(
-                            "Replaced live-thinking bubble %s with final answer for session %s.",
-                            _lt_bubble_id, session_key or "?",
+                _lt_replaced = False
+                for _lt_attempt in range(3):
+                    try:
+                        _lt_edit_res = await _live_thinking_adapter.edit_message(
+                            source.chat_id,
+                            _lt_bubble_id,
+                            _final,
+                            finalize=True,
                         )
-                except Exception as _lt_edit_err:
-                    logger.debug(
-                        "Failed to replace live-thinking bubble with final answer: %s", _lt_edit_err
+                        if getattr(_lt_edit_res, "success", False):
+                            _lt_replaced = True
+                            break
+                    except Exception as _lt_edit_err:
+                        logger.debug(
+                            "live_thinking bubble replace attempt %d/3 failed: %s",
+                            _lt_attempt + 1, _lt_edit_err,
+                        )
+                    if _lt_attempt < 2:
+                        await asyncio.sleep(0.5 * (2 ** _lt_attempt))  # 0.5s, 1s
+                if _lt_replaced:
+                    response["already_sent"] = True
+                    # Clear so the post-delivery delete callback is a no-op.
+                    _live_thinking_post_ids.clear()
+                    logger.info(
+                        "Replaced live-thinking bubble %s with final answer for session %s.",
+                        _lt_bubble_id, session_key or "?",
                     )
 
         # Schedule deletion of tracked temporary progress bubbles after the
@@ -18262,12 +18280,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _cleanup_live_thinking_bubble() -> None:
                 async def _delete_lt_bubble() -> None:
                     for _mid in _lt_ids_snapshot:
-                        try:
-                            await _lt_adapter_snapshot.delete_message(
-                                _lt_chat_id_snapshot, _mid
-                            )
-                        except Exception:
-                            pass
+                        for _attempt in range(3):
+                            try:
+                                _ok = await _lt_adapter_snapshot.delete_message(
+                                    _lt_chat_id_snapshot, _mid
+                                )
+                                if _ok:
+                                    break
+                            except Exception:
+                                pass
+                            if _attempt < 2:
+                                import asyncio as _aio
+                                await _aio.sleep(0.5 * (2 ** _attempt))  # 0.5s, 1s
                 try:
                     safe_schedule_threadsafe(
                         _delete_lt_bubble(), _lt_loop_snapshot,
