@@ -316,6 +316,38 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def build_session_subprocess_env(base_env: "dict | None" = None) -> dict:
+    """Build a subprocess env with current session ContextVar values overlaid.
+
+    Use when spawning subprocesses (e.g. kanban workers) that need
+    ``HERMES_SESSION_*`` vars.  ContextVars are task-local and do not cross
+    into child processes; this bridges them explicitly so workers inherit the
+    originating platform, chat, and thread from the dispatching gateway session.
+
+    Resolution per var:
+    1. ContextVar value (set by ``set_session_vars``) -- overrides os.environ.
+    2. ``os.environ`` fallback (CLI / cron / non-gateway paths that never call
+       ``set_session_vars``).
+    3. Omitted if absent from both.
+
+    Returns a new dict; does not mutate the caller's env.
+    """
+    import os as _os
+
+    env = dict(base_env) if base_env is not None else {}
+    for var_name, var in _VAR_MAP.items():
+        value = var.get()
+        if value is _UNSET:
+            # Never set in this context -- fall back to os.environ.
+            oval = _os.environ.get(var_name, "")
+            if oval:
+                env[var_name] = oval
+        else:
+            # Explicitly set (even to "") -- trust the ContextVar.
+            env[var_name] = value
+    return env
+
+
 def async_delivery_supported() -> bool:
     """Whether the current session can deliver a background completion later.
 
