@@ -7686,7 +7686,18 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
-    env = dict(os.environ)
+    # Seed the env from os.environ, then overlay any session ContextVars so
+    # the worker subprocess inherits the originating platform/chat/thread.
+    # ContextVars are task-local and don't cross the subprocess boundary on
+    # their own; this bridges them explicitly (mirrors #45940 approach).
+    # Workers can then auto-target send_message to the originating thread
+    # without needing the thread_id baked into the kanban brief.
+    try:
+        from gateway.session_context import build_session_subprocess_env
+        env = build_session_subprocess_env(dict(os.environ))
+    except ImportError:
+        # gateway not importable (e.g. test environments or standalone CLI)
+        env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
