@@ -19294,39 +19294,85 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and _live_thinking_post_ids
                 and _live_thinking_adapter is not None
             ):
-                # Live-thinking bubble is pending — edit it with the final reply
-                # so it seamlessly becomes the response, avoiding a delete
-                # + send sequence that leaves a "(message deleted)" artifact.
-                _lt_bubble_id = _live_thinking_post_ids[0]
-                _lt_replaced = False
+                # Live-thinking bubble is pending. Send the final answer as a
+                # brand-new post (so the user gets a fresh-message notification
+                # instead of a silent edit-in-place), then let the existing
+                # post-delivery cleanup callback below delete the old bubble.
+                # Send-then-delete keeps the bubble visible until the answer
+                # has actually landed. Never clear _live_thinking_post_ids here
+                # — that list is exactly what the cleanup callback deletes,
+                # and the new final post id must never end up in it.
+                _lt_bubble_ids_snapshot = list(_live_thinking_post_ids)
+                _lt_new_post_id = None
                 for _lt_attempt in range(3):
                     try:
-                        _lt_edit_res = await _live_thinking_adapter.edit_message(
+                        _lt_send_res = await _live_thinking_adapter.send(
                             source.chat_id,
-                            _lt_bubble_id,
                             _final,
-                            finalize=True,
+                            metadata=self._thread_metadata_for_source(
+                                source, event_message_id
+                            ),
                         )
-                        if getattr(_lt_edit_res, "success", False):
-                            _lt_replaced = True
+                        _lt_candidate_id = getattr(_lt_send_res, "message_id", None)
+                        if (
+                            getattr(_lt_send_res, "success", False)
+                            and _lt_candidate_id
+                            and str(_lt_candidate_id) not in _lt_bubble_ids_snapshot
+                        ):
+                            _lt_new_post_id = str(_lt_candidate_id)
                             break
-                    except Exception as _lt_edit_err:
+                    except Exception as _lt_send_err:
                         logger.debug(
-                            "live_thinking bubble replace attempt %d/3 failed: %s",
-                            _lt_attempt + 1, _lt_edit_err,
+                            "live_thinking final send attempt %d/3 failed: %s",
+                            _lt_attempt + 1, _lt_send_err,
                         )
                     if _lt_attempt < 2:
                         await asyncio.sleep(0.5 * (2 ** _lt_attempt))  # 0.5s, 1s
-                if _lt_replaced:
+                if _lt_new_post_id:
+                    # Safety invariant: the new final post must never be among
+                    # the ids the cleanup callback deletes.
+                    assert _lt_new_post_id not in _lt_bubble_ids_snapshot
                     response["already_sent"] = True
-                    response["live_thinking_final_post_id"] = _lt_bubble_id
+                    response["live_thinking_final_post_id"] = _lt_new_post_id
                     response["live_thinking_final_content"] = _final
-                    # Clear so the post-delivery delete callback is a no-op.
-                    _live_thinking_post_ids.clear()
                     logger.info(
-                        "Replaced live-thinking bubble %s with final answer for session %s.",
-                        _lt_bubble_id, session_key or "?",
+                        "Sent live-thinking final answer %s for session %s; bubble %s will be deleted.",
+                        _lt_new_post_id, session_key or "?", _lt_bubble_ids_snapshot,
                     )
+                else:
+                    # Send failed (or only returned an id matching the bubble,
+                    # which should never happen) — fall back to the original
+                    # edit-in-place behaviour so the answer is never lost.
+                    _lt_bubble_id = _live_thinking_post_ids[0]
+                    _lt_replaced = False
+                    for _lt_attempt in range(3):
+                        try:
+                            _lt_edit_res = await _live_thinking_adapter.edit_message(
+                                source.chat_id,
+                                _lt_bubble_id,
+                                _final,
+                                finalize=True,
+                            )
+                            if getattr(_lt_edit_res, "success", False):
+                                _lt_replaced = True
+                                break
+                        except Exception as _lt_edit_err:
+                            logger.debug(
+                                "live_thinking bubble replace attempt %d/3 failed: %s",
+                                _lt_attempt + 1, _lt_edit_err,
+                            )
+                        if _lt_attempt < 2:
+                            await asyncio.sleep(0.5 * (2 ** _lt_attempt))  # 0.5s, 1s
+                    if _lt_replaced:
+                        response["already_sent"] = True
+                        response["live_thinking_final_post_id"] = _lt_bubble_id
+                        response["live_thinking_final_content"] = _final
+                        # Clear so the post-delivery delete callback is a no-op.
+                        _live_thinking_post_ids.clear()
+                        logger.info(
+                            "Replaced live-thinking bubble %s with final answer for session %s (fallback).",
+                            _lt_bubble_id, session_key or "?",
+                        )
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
