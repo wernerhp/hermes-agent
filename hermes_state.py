@@ -3915,15 +3915,42 @@ class SessionDB:
             cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
             return cursor.fetchone()[0]
 
-    def session_count_by_source(self) -> Dict[str, int]:
-        """Return a ``{source: count}`` dict for all sessions.
+    def session_count_by_source(
+        self,
+        *,
+        include_archived: bool = True,
+        archived_only: bool = False,
+        exclude_children: bool = True,
+    ) -> Dict[str, int]:
+        """Return a ``{source: count}`` dict via a single ``GROUP BY`` query.
 
-        Uses a single ``GROUP BY`` query leveraging ``idx_sessions_source``
-        instead of iterating every row — O(number-of-sources) not O(N).
+        O(number-of-sources), not O(N): leverages ``idx_sessions_source``
+        instead of materialising rich rows.
+
+        ``exclude_children=True`` (default) mirrors ``list_sessions_rich``
+        visibility — roots plus branch sessions, excluding sub-agent runs,
+        delegates, and compression continuations — so the source badges match
+        the listable session counts they accompany. ``include_archived``
+        defaults to ``True`` to preserve the endpoint's prior behaviour.
+
+        ``COALESCE(s.source, 'cli')`` is applied identically in the SELECT and
+        the ``GROUP BY`` so a NULL source cannot produce two ``cli`` keys and
+        silently drop a count.
         """
+        where_clauses = []
+        if exclude_children:
+            where_clauses.append(_LISTABLE_CHILD_SQL)
+            where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+        if archived_only:
+            where_clauses.append("s.archived = 1")
+        elif not include_archived:
+            where_clauses.append("s.archived = 0")
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT COALESCE(source, 'cli'), COUNT(*) FROM sessions GROUP BY source"
+                "SELECT COALESCE(s.source, 'cli'), COUNT(*) "
+                f"FROM sessions s{where_sql} "
+                "GROUP BY COALESCE(s.source, 'cli')"
             )
             return {row[0]: row[1] for row in cursor.fetchall()}
 

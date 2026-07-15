@@ -1539,13 +1539,61 @@ class TestCounts:
         """Empty database returns empty dict."""
         assert db.session_count_by_source() == {}
 
-    def test_session_count_by_source_group_by_null_source(self, db):
-        """COALESCE handles the theoretical NULL case (source is NOT NULL in schema)."""
-        # source is NOT NULL in schema, but COALESCE is defensive.
-        # Verify the method works even with the minimal set of sources.
-        db.create_session(session_id="s1", source="cli")
+    def test_session_count_by_source_excludes_children(self, db):
+        """Delegates and compression continuations must not inflate source counts.
+
+        The aggregate mirrors ``list_sessions_rich`` visibility so the source
+        badges match the listable session counts. A delegate subagent child and
+        a compression continuation should both be excluded, while a root and a
+        /branch child stay counted.
+        """
+        db.create_session(session_id="root", source="cli")
+        # Delegate subagent child — carries the _delegate_from marker.
+        db.create_session(
+            session_id="delegate",
+            source="cli",
+            parent_session_id="root",
+            model_config={"_delegate_from": "root"},
+        )
+        # Compression continuation — parent ended with end_reason 'compression'.
+        db.create_session(session_id="comp_parent", source="telegram")
+        db.end_session("comp_parent", "compression")
+        db.create_session(
+            session_id="comp_child",
+            source="telegram",
+            parent_session_id="comp_parent",
+        )
+        # /branch child — carries the _branched_from marker, stays visible.
+        db.create_session(
+            session_id="branch",
+            source="discord",
+            parent_session_id="root",
+            model_config={"_branched_from": "root"},
+        )
         result = db.session_count_by_source()
-        assert result == {"cli": 1}
+        # root(cli) + comp_parent(telegram) + branch(discord); delegate and
+        # comp_child excluded.
+        assert result == {"cli": 1, "telegram": 1, "discord": 1}
+        # include-children view sees every row.
+        assert db.session_count_by_source(exclude_children=False) == {
+            "cli": 2,
+            "telegram": 2,
+            "discord": 1,
+        }
+
+    def test_session_count_by_source_coalesce_matches_group_by(self, db):
+        """SELECT and GROUP BY both use ``COALESCE(source, 'cli')`` identically.
+
+        ``source`` is ``NOT NULL`` in the live schema so a NULL row is
+        unreachable, but the defensive ``COALESCE`` must appear identically in
+        the ``GROUP BY`` (not group on raw ``source``) so it can never split a
+        bucket and drop a count. Repeated 'cli' rows collapse to one key with
+        the full count.
+        """
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        db.create_session(session_id="s3", source="cli")
+        assert db.session_count_by_source() == {"cli": 3}
 
     def test_message_count_total(self, db):
         assert db.message_count() == 0

@@ -436,6 +436,34 @@ class TestSessionManagementEndpoints:
         assert {"total", "active_store", "archived", "messages", "by_source"} <= set(body)
         assert body["total"] >= 1
 
+    def test_stats_source_counts_use_direct_aggregate(self, monkeypatch):
+        """Source badges must use the grouped aggregate, not rich session rows.
+
+        Large stores can hold thousands of sessions; the stats endpoint only
+        needs grouped counts, so it must not call ``list_sessions_rich`` (which
+        builds preview / last-active rows) just to count source labels.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="sess-discord", source="discord")
+            db.create_session(session_id="sess-cron", source="cron")
+        finally:
+            db.close()
+
+        def _fail_list_sessions_rich(self, *args, **kwargs):
+            raise AssertionError("stats should use grouped source counts")
+
+        monkeypatch.setattr(SessionDB, "list_sessions_rich", _fail_list_sessions_rich)
+
+        r = self.client.get("/api/sessions/stats")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["by_source"]["cli"] == 1
+        assert body["by_source"]["discord"] == 1
+        assert body["by_source"]["cron"] == 1
+
     def test_rename(self):
         r = self.client.patch("/api/sessions/sess-x", json={"title": "Renamed"})
         assert r.status_code == 200 and r.json()["title"] == "Renamed"
