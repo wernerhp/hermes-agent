@@ -450,35 +450,50 @@ def _non_conversational_metadata(
     return merged
 
 
-def _interim_metadata(metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Mark a mid-turn status/advisory send as NOT the turn-final.
+async def _update_live_bubble_via_adapter(
+    adapter: Any,
+    live_thinking_post_ids: list,
+    bubble_text: str,
+    status_chat_id: Any,
+    *,
+    status_thread_metadata: Optional[Dict[str, Any]] = None,
+    platform: Any = None,
+) -> None:
+    """Edit the tracked live-thinking bubble in place, or replace it.
 
-    Stream-is-the-message adapters seal the live stream with the first unmarked send to an armed (chat, turn)
-    key, so every mid-turn send MUST carry this marker. Gateway-internal; adapters strip it before the wire."""
-    merged = dict(metadata or {})
-    merged["_interim_send"] = True
-    return merged
+    Mutates ``live_thinking_post_ids`` (expected: a single-element list acting
+    as a mutable box shared with the caller's post-delivery cleanup step).
 
-
-def _seed_hygiene_system_prompt(agent: Any, session_row: Optional[Dict[str, Any]]) -> bool:
-    """Keep gateway hygiene from rebuilding a live session's system prompt.
-
-    Hygiene lacks the live prompt environment, so a rebuild (persisted by compression) would strip external
-    provider blocks. Seed the persisted prompt (or an empty cache entry); the real turn rebuilds properly."""
-    stored_prompt = ""
-    if isinstance(session_row, dict):
-        raw_prompt = session_row.get("system_prompt")
-        if isinstance(raw_prompt, str) and raw_prompt.strip():
-            stored_prompt = raw_prompt
-
-    agent._cached_system_prompt = stored_prompt
-    return bool(stored_prompt)
-
-
-_TRANSIENT_NETWORK_ERROR_CLASS_NAMES = frozenset({
-    "TimedOut", "NetworkError", "ReadError", "WriteError", "ConnectError", "ConnectTimeout",
-    "ReadTimeout", "WriteTimeout", "PoolTimeout", "RemoteProtocolError", "ServerDisconnectedError",
-    "ClientConnectorError", "ClientOSError"})
+    On edit-failure, ``existing_id`` was a real post the edit didn't touch —
+    it is deleted (best-effort) before a fresh post is sent and tracked, so
+    the old bubble is never orphaned in the channel once tracking moves to
+    the replacement id.
+    """
+    existing_id = live_thinking_post_ids[0] if live_thinking_post_ids else None
+    edit_ok = False
+    if existing_id:
+        try:
+            res = await adapter.edit_message(status_chat_id, existing_id, bubble_text)
+            edit_ok = bool(getattr(res, "success", False))
+        except Exception as _ee:
+            logger.debug("live_thinking edit failed: %s", _ee)
+    if not edit_ok:
+        if existing_id:
+            try:
+                await adapter.delete_message(status_chat_id, existing_id)
+            except Exception as _dle:
+                logger.debug("live_thinking orphaned-bubble delete failed: %s", _dle)
+        send_res = await adapter.send(
+            status_chat_id,
+            bubble_text,
+            metadata=_non_conversational_metadata(status_thread_metadata, platform=platform),
+        )
+        new_id = getattr(send_res, "message_id", None)
+        if getattr(send_res, "success", False) and new_id:
+            if live_thinking_post_ids:
+                live_thinking_post_ids[0] = str(new_id)
+            else:
+                live_thinking_post_ids.append(str(new_id))
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -8934,34 +8949,14 @@ class GatewayRunner(
                         # racing into a duplicate (or orphaning the first send).
                         async with _live_thinking_lock:
                             try:
-                                _existing_id = _live_thinking_post_ids[0] if _live_thinking_post_ids else None
-                                _edit_ok = False
-                                if _existing_id:
-                                    try:
-                                        _res = await _lta.edit_message(
-                                            _status_chat_id,
-                                            _existing_id,
-                                            bubble_text,
-                                        )
-                                        _edit_ok = getattr(_res, "success", False)
-                                    except Exception as _ee:
-                                        logger.debug("live_thinking edit failed: %s", _ee)
-                                if not _edit_ok:
-                                    # No existing post (or edit failed) — send a fresh one.
-                                    _send_res = await _lta.send(
-                                        _status_chat_id,
-                                        bubble_text,
-                                        metadata=_non_conversational_metadata(
-                                            _status_thread_metadata,
-                                            platform=source.platform,
-                                        ),
-                                    )
-                                    _new_id = getattr(_send_res, "message_id", None)
-                                    if getattr(_send_res, "success", False) and _new_id:
-                                        if _live_thinking_post_ids:
-                                            _live_thinking_post_ids[0] = str(_new_id)
-                                        else:
-                                            _live_thinking_post_ids.append(str(_new_id))
+                                await _update_live_bubble_via_adapter(
+                                    _lta,
+                                    _live_thinking_post_ids,
+                                    bubble_text,
+                                    _status_chat_id,
+                                    status_thread_metadata=_status_thread_metadata,
+                                    platform=source.platform,
+                                )
                             except Exception as _ble:
                                 logger.debug("live_thinking bubble update error: %s", _ble)
 
