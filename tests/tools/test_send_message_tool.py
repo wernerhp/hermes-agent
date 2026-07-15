@@ -317,6 +317,301 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_no_target_no_session_origin_is_rejected(self):
+        """Bare send_message(message=...) with no session origin still errors."""
+        with patch.dict(os.environ, {}, clear=True):
+            result = json.loads(
+                send_message_tool({"action": "send", "message": "hello"})
+            )
+
+        assert "error" in result
+        assert "target" in result["error"]
+
+    def test_no_target_falls_back_to_session_origin(self):
+        """Bare send_message(message=...) resolves to the forwarded origin
+        session (platform + chat_id + thread_id) when no explicit target is
+        given — see gateway.session_context.build_session_subprocess_env."""
+        config, telegram_cfg = _make_config()
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_SESSION_PLATFORM": "telegram",
+                "HERMES_SESSION_CHAT_ID": "-1001",
+                "HERMES_SESSION_THREAD_ID": "17585",
+            },
+            clear=True,
+        ), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool({"action": "send", "message": "hello"})
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001",
+            "hello",
+            thread_id="17585",
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_explicit_target_overrides_session_origin(self):
+        """An explicit target always wins over the session-origin fallback."""
+        config, telegram_cfg = _make_config()
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_SESSION_PLATFORM": "telegram",
+                "HERMES_SESSION_CHAT_ID": "-1001",
+                "HERMES_SESSION_THREAD_ID": "17585",
+            },
+            clear=True,
+        ), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:-2002",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-2002",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_cron_duplicate_target_is_skipped_and_explained(self):
+        home = SimpleNamespace(chat_id="-1001")
+        config, _telegram_cfg = _make_config()
+        config.get_home_channel = lambda _platform: home
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_CRON_AUTO_DELIVER_PLATFORM": "telegram",
+                "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "-1001",
+            },
+            clear=False,
+        ), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["reason"] == "cron_auto_delivery_duplicate_target"
+        assert "final response" in result["note"]
+        send_mock.assert_not_awaited()
+        mirror_mock.assert_not_called()
+
+    def test_resolved_telegram_topic_name_preserves_thread_id(self):
+        config, telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.channel_directory.resolve_channel_name", return_value="-1001:17585"), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:Coaching Chat / topic 17585",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001",
+            "hello",
+            thread_id="17585",
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_display_label_target_resolves_via_channel_directory(self, tmp_path):
+        config, telegram_cfg = _make_config()
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {
+                "telegram": [
+                    {"id": "-1001:17585", "name": "Coaching Chat / topic 17585", "type": "group"}
+                ]
+            },
+        }))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:Coaching Chat / topic 17585 (group)",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001",
+            "hello",
+            thread_id="17585",
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_resolved_slack_thread_name_preserves_thread_id(self):
+        slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.SLACK: slack_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.channel_directory.resolve_channel_name", return_value="C123ABCDEF:171.000001"), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "slack:ops / topic 171.000001",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.SLACK,
+            slack_cfg,
+            "C123ABCDEF",
+            "hello",
+            thread_id="171.000001",
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_resolved_matrix_thread_name_preserves_thread_id(self):
+        matrix_cfg = SimpleNamespace(
+            enabled=True,
+            token="tok",
+            extra={"homeserver": "https://matrix.example.com"},
+        )
+        config = SimpleNamespace(
+            platforms={Platform.MATRIX: matrix_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch(
+                 "gateway.channel_directory.resolve_channel_name",
+                 return_value="!roomid:matrix.example.org:$thread123:matrix.example.org",
+             ), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "matrix:Ops / topic $thread123",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.MATRIX,
+            matrix_cfg,
+            "!roomid:matrix.example.org",
+            "hello",
+            thread_id="$thread123:matrix.example.org",
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_mirror_receives_current_session_user_id(self):
+        config, _telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "telegram",
+                "HERMES_SESSION_USER_ID": "user-123",
+            }.get(name, default)
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:12345",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        mirror_mock.assert_called_once_with(
+            "telegram",
+            "12345",
+            "hello",
+            source_label="telegram",
+            thread_id=None,
+            user_id="user-123",
+        )
 
     def test_media_tag_outside_allowed_roots_is_not_sent(self, tmp_path, monkeypatch):
         # This test exercises the strict-allowlist path; force strict mode on
