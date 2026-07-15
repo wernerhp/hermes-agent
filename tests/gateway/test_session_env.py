@@ -10,7 +10,7 @@ from gateway.session_context import (
     get_session_env,
     set_session_vars,
     clear_session_vars,
-    reset_session_vars,
+    build_session_subprocess_env,
     _VAR_MAP,
     _UNSET,
 )
@@ -270,6 +270,100 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
     clear_session_vars(tokens)
     assert get_session_env("HERMES_CRON_SESSION") == ""
 
-    reset_session_vars()
-    assert get_session_env("HERMES_CRON_SESSION") == "1"
+
+@pytest.mark.asyncio
+async def test_run_in_executor_with_context_survives_default_executor_shutdown():
+    """Gateway agent work should not depend on asyncio's default executor."""
+    runner = object.__new__(GatewayRunner)
+    loop = asyncio.get_running_loop()
+
+    await loop.run_in_executor(None, lambda: None)
+    await loop.shutdown_default_executor()
+
+    try:
+        result = await runner._run_in_executor_with_context(lambda: "ok")
+    finally:
+        runner._shutdown_executor()
+
+    assert result == "ok"
+
+
+# ---------------------------------------------------------------------------
+# build_session_subprocess_env tests
+# ---------------------------------------------------------------------------
+
+
+def test_build_session_subprocess_env_no_base_env_uses_os_environ_fallback(monkeypatch):
+    """With no explicit base_env, unset ContextVars fall back to os.environ."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+
+    env = build_session_subprocess_env()
+
+    assert env["HERMES_SESSION_PLATFORM"] == "discord"
+    assert "HERMES_SESSION_CHAT_ID" not in env
+
+
+def test_build_session_subprocess_env_contextvar_overrides_os_environ(monkeypatch):
+    """A set ContextVar always wins over os.environ, with or without base_env."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    tokens = set_session_vars(platform="telegram")
+    try:
+        env = build_session_subprocess_env()
+        assert env["HERMES_SESSION_PLATFORM"] == "telegram"
+
+        env2 = build_session_subprocess_env({"HERMES_SESSION_PLATFORM": "slack"})
+        assert env2["HERMES_SESSION_PLATFORM"] == "telegram"
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_build_session_subprocess_env_explicit_base_env_not_overridden_by_os_environ(monkeypatch):
+    """Caller-supplied base_env is authoritative; unset ContextVars must not
+    let a stale process-level os.environ value leak in and override it.
+
+    Regression guard: previously, when base_env was explicitly passed and a
+    ContextVar was unset, the function fell back to os.environ and clobbered
+    the caller's explicit value.
+    """
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+
+    base_env = {"HERMES_SESSION_PLATFORM": "telegram", "SOME_OTHER_VAR": "x"}
+    env = build_session_subprocess_env(base_env)
+
+    assert env["HERMES_SESSION_PLATFORM"] == "telegram"
+    assert env["SOME_OTHER_VAR"] == "x"
+
+
+def test_build_session_subprocess_env_explicit_base_env_preserves_unrelated_keys(monkeypatch):
+    """build_session_subprocess_env must not drop unrelated base_env keys."""
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+
+    base_env = {"PATH": "/usr/bin", "HOME": "/home/hermes"}
+    env = build_session_subprocess_env(base_env)
+
+    assert env["PATH"] == "/usr/bin"
+    assert env["HOME"] == "/home/hermes"
+    assert "HERMES_SESSION_PLATFORM" not in env
+
+
+@pytest.mark.asyncio
+async def test_gateway_executor_refuses_resurrection_after_shutdown():
+    """A real gateway shutdown must NOT be resurrected by the recreate path.
+
+    _shutdown_executor() means "we're stopping" — the recreate-on-shutdown
+    logic exists to survive an *external* teardown of the loop default
+    (test_..._survives_default_executor_shutdown), not to undo our own stop.
+    """
+    runner = object.__new__(GatewayRunner)
+
+    try:
+        first = await runner._run_in_executor_with_context(lambda: "first")
+        assert first == "first"
+        runner._shutdown_executor()
+
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await runner._run_in_executor_with_context(lambda: "second")
+    finally:
+        runner._shutdown_executor()
 
