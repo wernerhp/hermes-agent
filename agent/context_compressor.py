@@ -4931,204 +4931,22 @@ Write only the summary body. Do not include any preamble or prefix."""
 
 def is_compaction_summary_message(message: Any) -> bool:
     """Return True when *message* is a context-compaction handoff summary.
-    Public API. Uses the metadata key, falling back to content heuristics because the key is stripped by
-    wire sanitizers and some session-store round-trips."""
-    cls = ContextCompressor
-    return cls._is_context_summary_message(message) if isinstance(message, dict) else cls._is_context_summary_content(message)
 
+    Public API for consumers outside the compressor (memory providers,
+    frontends) that must not treat compaction summaries as real user or
+    assistant turns — e.g. fact extraction harvesting the compactor's own
+    output as user statements (#57682).
 
-# Display metadata that survives projection; other metadata may describe synthetic events and must
-# not look human.
-SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS = ("reactions",)
-
-
-def _handoff_only_content(content: Any) -> Any:
-    """Project summary-bearing content to the synthetic handoff alone; never keeps live media."""
-    def _through_end_marker(text: str) -> str:
-        marker_idx = text.find(_SUMMARY_END_MARKER)
-        return text[: marker_idx + len(_SUMMARY_END_MARKER)] if marker_idx >= 0 else text
-
-    if isinstance(content, str):
-        if _MERGED_SUMMARY_DELIMITER in content:
-            content = content.split(_MERGED_SUMMARY_DELIMITER, 1)[1].lstrip()
-        return _through_end_marker(content)
-    if not isinstance(content, list):
-        return content
-    # Ordinary merge: summary suffix starts in the delimiter part; later parts may carry live media
-    # — never retain.
-    for item in content:
-        text = _part_text(item)
-        if not isinstance(text, str) or _MERGED_SUMMARY_DELIMITER not in text:
-            continue
-        suffix = _through_end_marker(text.split(_MERGED_SUMMARY_DELIMITER, 1)[1].lstrip())
-        return [_with_part_text(item, suffix)] if suffix else []
-
-    # Force-user-leading: keep parts through the end marker, truncated before the live ask.
-    projected: list[Any] = []
-    for item in content:
-        text = _part_text(item)
-        if not isinstance(text, str):
-            continue
-        if _SUMMARY_END_MARKER in text:
-            projected.append(_with_part_text(item, text.split(_SUMMARY_END_MARKER, 1)[0] + _SUMMARY_END_MARKER))
-            return projected
-        projected.append(item.copy() if isinstance(item, dict) else item)
-    return projected
-
-
-def split_user_originated_turn(message: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Split a user row into ``(handoff_only, live_view)``; either may be None; fresh dicts."""
-    if not isinstance(message, dict) or message.get("role") != "user":
-        return None, None
-
-    is_summary = is_compaction_summary_message(message)
-    handoff: Optional[Dict[str, Any]] = None
-    if is_summary:
-        handoff = {
-            "role": "user", "content": _handoff_only_content(message.get("content")),
-            COMPRESSED_SUMMARY_METADATA_KEY: True, "display_kind": "hidden",
-        }
-        if COMPRESSED_SUMMARY_HAS_USER_TURN_KEY in message:
-            handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = bool(message.get(COMPRESSED_SUMMARY_HAS_USER_TURN_KEY))
-        if message.get(MICRO_COMPACT_MARKER_KEY):
-            handoff[MICRO_COMPACT_MARKER_KEY] = True
-        if message.get("timestamp") is not None:
-            handoff["timestamp"] = message["timestamp"]
-        drop_stale_api_content(handoff)
-        # Hidden is the legacy compaction wrapper and doesn't hide an unwrapped human payload; other
-        # kinds are synthetic.
-        display_kind = message.get("display_kind")
-        candidate = None if display_kind and display_kind != "hidden" else ContextCompressor._strip_context_summary_handoff_message(message)
-        if candidate is None:
-            return handoff, None
-    elif message.get("display_kind") and message.get("display_kind") != STEER_DISPLAY_KIND:
-        return None, None
+    Prefers the in-process ``COMPRESSED_SUMMARY_METADATA_KEY`` marker and
+    falls back to the content heuristics in ``_is_context_summary_content``
+    (which cover the merged-into-tail and historical-prefix cases), because
+    the metadata key is stripped by the wire sanitizers and does not survive
+    all session-store round-trips.
+    """
+    if isinstance(message, dict):
+        if message.get(COMPRESSED_SUMMARY_METADATA_KEY):
+            return True
+        content = message.get("content")
     else:
-        candidate = message.copy()  # includes a typed /steer row: full user authority
-
-    for key in (
-        COMPRESSED_SUMMARY_METADATA_KEY, COMPRESSED_SUMMARY_HAS_USER_TURN_KEY, MICRO_COMPACT_MARKER_KEY,
-        _DB_PERSISTED_MARKER, *(("_row_id",) if is_summary else ()), "display_kind", "display_metadata",
-    ):
-        candidate.pop(key, None)
-    carrier_metadata = message.get("display_metadata")
-    if isinstance(carrier_metadata, dict):
-        durable_metadata = {
-            key: copy.deepcopy(carrier_metadata[key]) for key in SUMMARY_CARRIER_DURABLE_DISPLAY_METADATA_KEYS if key in carrier_metadata
-        }
-        if durable_metadata:
-            candidate["display_metadata"] = durable_metadata
-    drop_stale_api_content(candidate)
-    cls = ContextCompressor
-    if cls._is_synthetic_compression_user_turn(candidate) or not cls._is_actionable_user_turn(candidate):
-        return handoff, None
-    return handoff, candidate
-
-
-def user_originated_turn_view(message: Any) -> Optional[Dict[str, Any]]:
-    """Return the live human-authored projection of a user row, if any."""
-    return split_user_originated_turn(message)[1]
-
-
-def history_before_user_originated_turn(
-    messages: List[Dict[str, Any]], index: int,
-) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Rewind prefix and canonical live view for ``index``; a composite carrier keeps its handoff scaffold at the head."""
-    if index < 0 or index >= len(messages):
-        raise IndexError("user turn index is outside the transcript")
-    handoff, live_view = split_user_originated_turn(messages[index])
-    if live_view is None:
-        raise ValueError("selected row is not a user-originated turn")
-    prefix = [message.copy() for message in messages[:index]] + ([handoff] if handoff is not None else [])
-    return prefix, live_view
-
-
-def retryable_user_text(content: Any) -> str:
-    """Lossless retry text, or raise before destructive mutation (media/unknown parts fail closed: no replay protocol)."""
-    if not isinstance(content, (str, list)):
-        raise ValueError("retry does not support non-text content")
-    chunks: list[str] = []
-    for part in [content] if isinstance(content, str) else content:
-        if isinstance(part, str):
-            chunks.append(part)
-            continue
-        if not isinstance(part, dict):
-            raise ValueError("retry does not support non-text content")
-        if part.get("type") not in {"text", "input_text", "output_text"}:
-            raise ValueError("retry does not support media or unknown content parts")
-        if set(part) - {"type", "text"}:
-            raise ValueError("retry cannot losslessly flatten annotated text parts")
-        if not isinstance(part.get("text"), str):
-            raise ValueError("retry text parts must contain text")
-        chunks.append(part["text"])
-    text = "".join(chunks)
-    if not text.strip():
-        raise ValueError("retry found no text to send")
-    return text
-
-
-def _handoff_carries_live_user_content(message: Any) -> bool:
-    """True when a summary-bearing row still carries a live user ask (pre-filter with ``is_compaction_summary_message``)."""
-    return isinstance(message, dict) and ContextCompressor._strip_context_summary_handoff_message(message) is not None
-
-
-def reference_handoff_would_drive_next_model_call(messages: Optional[List[Dict[str, Any]]]) -> bool:
-    """True when the next model call would be driven only by a handoff; trailing tool rows mean an in-flight exchange."""
-    if not messages:
-        return False
-
-    last_driving_handoff = -1
-    for index, message in enumerate(messages):
-        if not is_compaction_summary_message(message):
-            continue
-        merged_completed_assistant = (
-            isinstance(message, dict) and message.get("role") == "assistant"
-            and ContextCompressor.classify_summary_content(message.get("content")) == "merged"
-            and message.get("finish_reason") == "stop" and not message.get("tool_calls")
-        )
-        # Embedded live ask or pending tool_calls -> not a sole-handoff driver.
-        if not (_handoff_carries_live_user_content(message) and not merged_completed_assistant):
-            last_driving_handoff = index
-    if last_driving_handoff < 0:
-        return False
-    for message in messages[last_driving_handoff + 1 :]:
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role")
-        if (
-            role == "tool" or (role == "assistant" and message.get("tool_calls"))
-            or (
-                ContextCompressor._is_actionable_user_turn(message)
-                and not ContextCompressor._is_synthetic_compression_user_turn(message)
-            )
-            or (is_compaction_summary_message(message) and _handoff_carries_live_user_content(message))
-        ):
-            return False
-    return True
-
-
-def is_user_originated_turn(message: Any) -> bool:
-    """True for human-authored user turns (not compaction scaffolding); dispatchers must use this, not a bare role check."""
-    return user_originated_turn_view(message) is not None
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'tool_result_id_variants': ('agent.message_sanitization', 'tool_result_id_variants'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----
+        content = message
+    return ContextCompressor._is_context_summary_content(content)

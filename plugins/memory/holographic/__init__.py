@@ -178,9 +178,14 @@ class HolographicMemoryProvider(MemoryProvider):
             return tool_error(str(exc))
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        # is_truthy_value: auto_extract is a string enum ("false"/"true"); plain truthiness would treat "false" as on.
-        if is_truthy_value(self._config.get("auto_extract", False)) and self._store and messages:
-            self._auto_extract_facts(messages)
+        # is_truthy_value: the config schema declares auto_extract as a string
+        # enum ("false"/"true"), and a plain truthiness check treats the string
+        # "false" as enabled (#57682).
+        if not is_truthy_value(self._config.get("auto_extract", False)):
+            return
+        if not self._store or not messages:
+            return
+        self._auto_extract_facts(messages)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes as facts."""
@@ -228,10 +233,45 @@ class HolographicMemoryProvider(MemoryProvider):
     }
 
     def _auto_extract_facts(self, messages: list) -> None:
-        # Compaction handoff summaries arrive as role="user" and match the decision patterns; never store the
-        # compactor's own output as a fact. A merge-into-tail row holds genuine prior user text BEFORE
-        # _MERGED_SUMMARY_DELIMITER (after the header) and the summary AFTER it — harvest only that segment.
-        from agent.context_compressor import _MERGED_PRIOR_CONTEXT_HEADER, _MERGED_SUMMARY_DELIMITER, is_compaction_summary_message  # heavy; lazy
+        # Local import (pattern used in initialize()): the compressor module is
+        # heavier than this plugin and is only needed when auto_extract is on.
+        from agent.context_compressor import (
+            _MERGED_PRIOR_CONTEXT_HEADER,
+            _MERGED_SUMMARY_DELIMITER,
+            is_compaction_summary_message,
+        )
+
+        def _pre_delimiter_user_segment(msg: dict):
+            """Return the genuine user text preceding a merged-into-tail
+            compaction summary, or None when the whole message is a summary.
+
+            Merge-into-tail messages (agent/context_compressor.py ~3163-3190)
+            wrap real prior tail content BEFORE ``_MERGED_SUMMARY_DELIMITER``,
+            prefixed with ``_MERGED_PRIOR_CONTEXT_HEADER``, then append the
+            generated handoff summary AFTER the delimiter. Dropping the whole
+            row (as ``is_compaction_summary_message`` alone would suggest)
+            discards that genuine pre-delimiter content too (#57690 review).
+            Only the summary suffix must be excluded from harvesting.
+            """
+            content = msg.get("content", "")
+            if not isinstance(content, str) or _MERGED_SUMMARY_DELIMITER not in content:
+                return None
+            pre = content.split(_MERGED_SUMMARY_DELIMITER, 1)[0]
+            if pre.startswith(_MERGED_PRIOR_CONTEXT_HEADER):
+                pre = pre[len(_MERGED_PRIOR_CONTEXT_HEADER):]
+            pre = pre.strip()
+            return pre or None
+
+        _PREF_PATTERNS = [
+            re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
+            re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
+            re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
+        ]
+        _DECISION_PATTERNS = [
+            re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
+            re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
+        ]
+
         extracted = 0
         for msg in messages:
             content = msg.get("content", "") if msg.get("role") == "user" else None
@@ -241,6 +281,20 @@ class HolographicMemoryProvider(MemoryProvider):
                 content = pre
             elif content is None or is_compaction_summary_message(msg):
                 continue
+            # Compaction handoff summaries can be inserted as role="user"
+            # messages; their prose reliably matches the decision patterns, so
+            # without this guard the compactor's own output is stored as a
+            # durable "fact" on every rollover (#57682). A merge-into-tail
+            # summary also carries genuine pre-delimiter user content in the
+            # SAME row; harvest that segment instead of dropping the whole
+            # message (#57690 review).
+            pre_delimiter_segment = _pre_delimiter_user_segment(msg)
+            if pre_delimiter_segment is not None:
+                content = pre_delimiter_segment
+            elif is_compaction_summary_message(msg):
+                continue
+            else:
+                content = msg.get("content", "")
             if not isinstance(content, str) or len(content) < 10:
                 continue
             for patterns, category in _EXTRACT_CATEGORIES:
