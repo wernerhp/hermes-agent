@@ -669,3 +669,38 @@ class TestLiveThinking:
                 }
             }
             assert resolve_display_setting(config, "mattermost", "live_thinking") is True, val
+
+
+class TestLiveStatusSetting:
+    """display.live_status — tri-state normalisation + platform overrides."""
+
+    def test_default_is_full(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "slack", "live_status") == "full"
+
+    def test_bool_and_string_coercion(self):
+        from gateway.display_config import resolve_display_setting
+
+        for raw, expected in [
+            (True, "full"), (False, "off"),
+            ("on", "full"), ("all", "full"),
+            ("no", "off"), ("verb", "verb"),
+            ("bogus", "full"),
+        ]:
+            config = {"display": {"live_status": raw}}
+            assert (
+                resolve_display_setting(config, "slack", "live_status") == expected
+            ), f"raw={raw!r}"
+
+    def test_per_platform_override_wins(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "live_status": "full",
+                "platforms": {"slack": {"live_status": "verb"}},
+            }
+        }
+        assert resolve_display_setting(config, "slack", "live_status") == "verb"
+        assert resolve_display_setting(config, "google_chat", "live_status") == "full"
