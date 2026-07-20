@@ -21878,9 +21878,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     for _mid in _lt_ids_snapshot:
                         for _attempt in range(3):
                             try:
-                                _ok = await _lt_adapter_snapshot.delete_message(
-                                    _lt_chat_id_snapshot, _mid
-                                )
+                                try:
+                                    _ok = await _lt_adapter_snapshot.delete_message(
+                                        _lt_chat_id_snapshot, _mid, permanent=True
+                                    )
+                                except TypeError:
+                                    # Adapter's delete_message doesn't accept
+                                    # `permanent` — fall back to its default
+                                    # (soft) delete.
+                                    _ok = await _lt_adapter_snapshot.delete_message(
+                                        _lt_chat_id_snapshot, _mid
+                                    )
                                 if _ok:
                                     break
                             except Exception:

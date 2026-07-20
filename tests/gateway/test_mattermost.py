@@ -1150,6 +1150,47 @@ class TestMattermostDeleteMessage:
         result = _run(adapter.delete_message("channel123", "post_abc"))
         assert result is False
 
+    def test_delete_message_permanent_issues_permanent_query(self, adapter):
+        """permanent=True issues DELETE posts/{id}?permanent=true."""
+        adapter._api_delete_with_status = AsyncMock(
+            return_value=({"status": "OK"}, 200)
+        )
+        adapter._api_delete = AsyncMock(return_value={"status": "OK"})
+        result = _run(
+            adapter.delete_message("channel123", "post_abc", permanent=True)
+        )
+        adapter._api_delete_with_status.assert_awaited_once_with(
+            "posts/post_abc?permanent=true"
+        )
+        adapter._api_delete.assert_not_awaited()
+        assert result is True
+
+    def test_delete_message_permanent_falls_back_on_501(self, adapter):
+        """501 (EnableAPIPostDeletion off) falls back to soft delete."""
+        adapter._api_delete_with_status = AsyncMock(return_value=({}, 501))
+        adapter._api_delete = AsyncMock(return_value={"status": "OK"})
+        result = _run(
+            adapter.delete_message("channel123", "post_abc", permanent=True)
+        )
+        adapter._api_delete_with_status.assert_awaited_once_with(
+            "posts/post_abc?permanent=true"
+        )
+        adapter._api_delete.assert_awaited_once_with("posts/post_abc")
+        assert result is True
+
+    def test_delete_message_permanent_falls_back_on_403(self, adapter):
+        """403 (token lacks system_admin) falls back to soft delete."""
+        adapter._api_delete_with_status = AsyncMock(return_value=({}, 403))
+        adapter._api_delete = AsyncMock(return_value={"status": "OK"})
+        result = _run(
+            adapter.delete_message("channel123", "post_abc", permanent=True)
+        )
+        adapter._api_delete_with_status.assert_awaited_once_with(
+            "posts/post_abc?permanent=true"
+        )
+        adapter._api_delete.assert_awaited_once_with("posts/post_abc")
+        assert result is True
+
     def test_api_delete_issues_delete_request(self, adapter):
         """_api_delete calls session.delete with correct URL and headers."""
         # Patch aiohttp inside the adapter module so this test works in
