@@ -594,6 +594,73 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     assert msg_event.message_id == "top_post_123"
 
 
+@pytest.mark.asyncio
+async def test_mattermost_top_level_dm_post_starts_fresh_session():
+    """A top-level DM post (no root_id) must key on its own post id so it starts a
+    fresh session and never inherits prior channel context — regardless of reply_mode."""
+    adapter = _make_adapter()
+    adapter._reply_mode = "channel"  # not thread mode; DM top-level must still get a fresh key
+    adapter._bot_user_id = "bot_user_id"
+    adapter._bot_username = "hermes-bot"
+    adapter.handle_message = AsyncMock()
+    post_data = {
+        "id": "dm_post_456",
+        "user_id": "user_123",
+        "channel_id": "dm_chan_789",
+        "message": "new top-level dm message",
+        "root_id": "",
+    }
+    event = {
+        "event": "posted",
+        "data": {
+            "post": json.dumps(post_data),
+            "channel_type": "D",
+            "sender_name": "@alice",
+        },
+    }
+
+    await adapter._handle_ws_event(event)
+
+    msg_event = adapter.handle_message.call_args[0][0]
+    # Keyed on its own post id -> unique session key -> fresh session, no inherited context.
+    assert msg_event.source.thread_id == "dm_post_456"
+    assert msg_event.source.message_id == "dm_post_456"
+    assert msg_event.message_id == "dm_post_456"
+
+
+@pytest.mark.asyncio
+async def test_mattermost_top_level_post_fresh_session_in_channel_mode():
+    """A top-level channel post in non-thread reply_mode must also key on its own post id
+    (fresh session), not fall back to the bare channel key that reuses prior context."""
+    adapter = _make_adapter()
+    adapter._reply_mode = "channel"
+    adapter._bot_user_id = "bot_user_id"
+    adapter._bot_username = "hermes-bot"
+    adapter.handle_message = AsyncMock()
+    post_data = {
+        "id": "chan_post_321",
+        "user_id": "user_123",
+        "channel_id": "chan_456",
+        "message": "@hermes-bot new top-level post",
+        "root_id": "",
+    }
+    event = {
+        "event": "posted",
+        "data": {
+            "post": json.dumps(post_data),
+            "channel_type": "O",
+            "sender_name": "@alice",
+        },
+    }
+
+    await adapter._handle_ws_event(event)
+
+    msg_event = adapter.handle_message.call_args[0][0]
+    assert msg_event.source.thread_id == "chan_post_321"
+    assert msg_event.source.message_id == "chan_post_321"
+    assert msg_event.message_id == "chan_post_321"
+
+
 # ---------------------------------------------------------------------------
 # Multiplex secondary-profile scope
 # ---------------------------------------------------------------------------
